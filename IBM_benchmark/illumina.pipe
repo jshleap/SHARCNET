@@ -1,0 +1,425 @@
+#!/bin/bash
+
+###############################
+# Power9 tests - WGS pipeline from FastQ (both Tumor and Normal) to FilterByOrientationBias
+################################
+set -e
+shopt -s expand_aliases
+
+if [[ $(arch) = ppc64le ]]
+then
+  export GATK_HOME=/bio/apps/gatk_4.1.4/gatk-4.1.4.1
+  export GATK_LOCAL_JAR=$GATK_HOME/libs/gatk.jar
+  export GATK_SPARK_JAR=$GATK_HOME/libs/gatk-spark.jar
+  export LD_LIBRARY_PATH=$GATK_HOME/libs:$LD_LIBRARY_PATH
+  alias timeit='/usr/bin/time'
+else
+  alias timeit='/cvmfs/soft.computecanada.ca/nix/var/nix/profiles/16.09/bin/time'
+fi
+
+# remove when samtools ready
+#export PATH=$PATH:$HOME/projects/def-jshleap/IBM_benchmark/bins
+
+workPath=$1
+if [ -z "${workPath}" ]
+then
+  workPath="${PWD}"
+fi
+
+ref="${workPath}"/Homo_sapiens_assembly38.fa
+ref_dir=/home/jshleap/projects/def-jshleap/IBM_benchmark/references
+
+knownSites=("${ref_dir}"/dbsnp_146.hg38.vcf.gz
+           "${ref_dir}"/Homo_sapiens_assembly38.known_indels.vcf.gz
+           "${ref_dir}"/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz)
+
+cd "${workPath}" || exit
+
+# Prepare reference
+if [ ! -s "${ref%%.*}".dict ]
+then
+    echo "### creating reference dictionary"
+    timeit -v -o time_CreateSequenceDictionary.log gatk --java-options \
+    "-Xmx20G -XX:+UseParallelGC -XX:ParallelGCThreads=4" \
+    CreateSequenceDictionary -R "${ref}" -O $(basename "${ref%.*}").dict \
+    --USE_JDK_DEFLATER=true --USE_JDK_INFLATER=true
+
+    timeit -v -o time_reffaidx.log samtools faidx "${ref}"
+    echo -e "###\n\n"
+fi
+
+opts="-Xmx32G -XX:+PrintGCDetails -Djava.io.tmpdir=/tmp"
+opts="${opts} -DGATK_STACKTRACE_ON_USER_EXCEPTION=true -Djava.library.path=$GATK_HOME/libs"
+
+# BWA MEM MAPPING and SAMTOOLS SORTING ############
+# The inputs are different that in benchmark
+illumina11=${ref_dir}/illumina/SRR10916731T_1.fastq
+illumina12=${ref_dir}/illumina/SRR10916731T_2.fastq
+illumina21=${ref_dir}/illumina/SRR10916734N_1.fastq
+illumina22=${ref_dir}/illumina/SRR10916734N_2.fastq
+#pacbio1=${ref_dir}/pacbio/SRR9087597_1.fastq
+
+prefT=illuminaT
+prefN=illuminaN
+#output1=${workPath}/${prefT}.bwa_sorted.bam
+#output2=${workPath}/${prefN}.bwa_sorted.bam
+#output2=$workPath/pacbio.bwa.bam
+
+#### Illumina #####
+rgn='@RG\tID:illumina_lane\tSM:illuminaN\tPL:illumina\tLB:illuminaN\tPU:illuminaN'
+rgt='@RG\tID:illumina_lane\tSM:illuminaT\tPL:illumina\tLB:illuminaT\tPU:illuminaT'
+if [ ! -s "${ref}".bwt ]; then
+    echo "### Executing bwa index on ${prefT} ###"
+    timeit -v -o time_bwa_index.log bwa index "${ref}"
+    echo -e "###\n\n"
+fi
+if [ ! -s time_${prefT}.log ] && [ ! -s  ${prefT}.sam ]
+then
+    echo "### Executing bwa mem on ${prefT} ###"
+    timeit -v -o time_${prefT}.log bwa mem -t 36 -Ma \
+    -R "${rgt}" "${ref}" ${illumina11} ${illumina12} > ${prefT}.sam
+    echo -e "###\n\n"
+fi
+
+wait
+if [ ! -s time_${prefN}.log ] && [ ! -s  ${prefN}.sam ]
+then
+    echo "### Executing bwa  on ${prefN} ###"
+    timeit -v -o time_${prefN}.log bwa mem -t 36 -Ma \
+    -R "${rgn}" "${ref}" ${illumina21} ${illumina22} > ${prefN}.sam
+     echo -e "\n\n\n"
+fi
+
+wait
+
+if [ ! -s time_AddOrReplaceReadGroups_${prefT}.log ] && [ ! -s  ${prefT}.bam ]
+then
+    echo "### Executing samtools sort  on ${prefT} ###"
+    timeit -v -o time_sort_${prefT}.log samtools sort ${prefT}.sam -@ 5 -m 10G \
+    -T illumina -o ${prefT}.bwa_sorted.bam
+     echo -e "###\n\n\n"
+    echo "### Executing AddOrReplaceReadGroups on ${prefT}.sam ###"
+    timeit -v -o time_AddOrReplaceReadGroups_${prefT}.log gatk  \
+    AddOrReplaceReadGroups -I ${prefT}.bwa_sorted.bam -O ${prefT}.bam \
+    --RGLB ${prefT} --RGPL illumina --RGPU ${prefT} --RGSM ${prefT} \
+    --SORT_ORDER 'coordinate' --CREATE_INDEX true
+#    timeit -v -o time_view_${prefT}.log samtools view -bS bwa_${prefT}.sam \
+#    -@ 18 > ${prefT}.bam
+     echo -e "###\n\n\n"
+fi
+
+wait
+
+if [ ! -s time_AddOrReplaceReadGroups_${prefN}.log ] && [ ! -s  ${prefN}.bam ]
+then
+    echo "### Executing samtools sort  on ${prefT} ###"
+    timeit -v -o time_sort_${prefN}.log samtools sort ${prefN}.sam \
+    -@ 5 -m 10G -T illumina -o ${prefN}.bwa_sorted.bam
+     echo -e "###\n\n\n"
+    echo "### Executing AddOrReplaceReadGroups on ${prefN}.sam ###"
+    timeit -v -o time_AddOrReplaceReadGroups_${prefN}.log gatk  \
+    AddOrReplaceReadGroups -I ${prefN}.bwa_sorted.bam -O ${prefN}.bam \
+    --RGLB ${prefN} --RGPL illumina --RGPU ${prefN} --RGSM ${prefN}  \
+    --SORT_ORDER 'coordinate' --CREATE_INDEX true
+#    timeit -v -o time_view_${prefN}.log samtools view -bS bwa_${prefN}.sam \
+#    -@ 18 > ${prefN}.bam
+     echo -e "###\n\n\n"
+fi
+
+wait
+
+##if [ ! -s time_sort_${prefT}.log ] && [ ! -s ${prefT}.bwa_sorted.bam ]
+##then
+##   echo "### Executing samtools sort  on ${prefT} ###"
+##    timeit -v -o time_sort_${prefT}.log samtools sort ${prefT}.bam -@ 10 -m 16G \
+##    -T illumina -o ${prefT}.bwa_sorted.bam
+##     echo -e "###\n\n\n"
+##fi
+##
+##wait
+##
+##
+##if [ ! -s time_sort_${prefN}.log ] && [ ! -s ${prefN}.bwa_sorted.bam ]
+##then
+##    echo "### Executing samtools sort  on ${prefT} ###"
+##
+##    timeit -v -o time_sort_${prefN}.log samtools sort ${prefN}.bam -@ 10 -m 16G \
+##       -T illumina -o ${prefN}.bwa_sorted.bam
+##     echo -e "###\n\n\n"
+##
+##fi
+##
+##wait
+
+
+#### PacBio ####
+
+
+######## Markduplicates ############
+
+#input1=${output1}
+#input2=${output2}
+#output1=$workPath/${prefT}.md.bam
+#output2=$workPath/${prefN}.md.bam
+### Illumina
+
+if [ ! -s time_MarkDuplicates_${prefT}.log ] && [ ! -s ${prefT}.md.bam ]
+then
+    echo "Executing GATK MarkDuplicates on ${prefT}.md.bam"
+    timeit -v -o time_markDup_${prefT}.log gatk --java-options \
+    "-Xmx20G -XX:+UseParallelGC -XX:ParallelGCThreads=4" MarkDuplicates \
+    -I ${prefT}.bam -O ${prefT}.md.bam -M illumina_bwa_metrics.txt \
+    -use_jdk_deflater -use_jdk_inflater --MAX_RECORDS_IN_RAM 5000000 \
+    --OPTICAL_DUPLICATE_PIXEL_DISTANCE 2500 --MAX_SEQS 5000000 \
+    --MAX_FILE_HANDLES 500 --CREATE_INDEX
+#    --remove-sequencing-duplicates --conf 'spark.executor.cores=4' \
+#    --create-output-bam-index
+    echo -e "###\n\n\n"
+fi
+wait
+
+if [ ! -s time_MarkDuplicates_${prefN}.log ] && [ ! -s ${prefN}.md.bam ]
+then
+    echo "Executing GATK MarkDuplicatesSpark on ${prefN}.md.bam"
+    timeit -v -o time_markDup_${prefN}.log gatk --java-options \
+    "-Xmx20G -XX:+UseParallelGC -XX:ParallelGCThreads=4" MarkDuplicates \
+    -I ${prefN}.bam -O ${prefN}.md.bam -M illumina_bwa_metrics.txt \
+    -use_jdk_deflater -use_jdk_inflater --MAX_RECORDS_IN_RAM 5000000 \
+    --OPTICAL_DUPLICATE_PIXEL_DISTANCE 2500 --MAX_SEQS 5000000 \
+    --MAX_FILE_HANDLES 500 --CREATE_INDEX
+#    --remove-sequencing-duplicates --conf 'spark.executor.cores=4' \
+#    --create-output-bam-index
+    echo -e "###\n\n\n"
+fi
+wait
+
+##### create index #####
+### Illumina ###
+##if [ ! -s time_index_${prefT}.log ] && [ ! -s ${prefT}.md.bam.bai ]
+##then
+##    echo "### Executing samtools index on ${output1}"
+##    timeit -v -o time_index_${prefT}.log samtools index -@ 36 \
+##    ${prefT}.md.bam
+##    echo -e "Time log written to time_index_${prefT}.log\n"
+##    echo -e "###\n\n"
+##fi
+##
+##if [ ! -s time_index_${prefN}.log ] && [ ! -s ${output2} ]
+##then
+##    echo "### Executing samtools index on ${output2}"
+##    timeit -v -o time_index_${prefN}.log samtools index -@ 36 \
+##    ${prefN}.md.bam
+##    echo -e "Time log written to time_index_${prefN}.log\n"
+##    echo -e "###\n\n"
+##fi
+
+### PacBio ###
+####
+
+##Setup knownSites
+for i in ${!knownSites[*]}
+  do
+    if [ $i == 0 ]
+    then
+      knownSiteArg="${knownSites[i]}"
+    else
+      knownSiteArg="${knownSiteArg} --known-sites ${knownSites[i]}"
+    fi
+done
+
+echo "knownSiteArg=${knownSiteArg}"
+## BASE QUALITY SCORE RECALIBRATION ##########
+
+##input1=$workPath/${prefT}.md.bam
+#input2=$workPath/${prefN}.md.bam
+##
+#### Illumina ###
+## Tumor
+##outfile1=$workPath/${prefT}_hg38.md.bam.br.table
+br_opts="${opts} -XX:+UseParallelGC -XX:ParallelGCThreads=20"
+if [ ! -s time_BaseRecalibrator_${prefT}.log ] || [ ! -s ${prefT}_hg38.md.bam.br.table ]
+then
+    echo "### Executing BaseRecalibrator on ${prefT}.md.bam"
+    timeit -v -o time_BaseRecalibrator_${prefT}.log gatk \
+    --java-options "${br_opts}" BaseRecalibrator -R "${ref}" -I ${prefT}.md.bam \
+    --known-sites "${ref_dir}"/dbsnp_146.hg38.vcf.gz \
+    --known-sites "${ref_dir}"/Homo_sapiens_assembly38.known_indels.vcf.gz \
+    --known-sites "${ref_dir}"/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz \
+    -O ${prefT}_hg38.md.bam.br.table
+#    --spark-runner LOCAL --spark-master local[36] --conf spark.local.dir=$workPath
+    echo -e "Time log written to time_BaseRecalibrator_${prefT}.log\n"
+    echo -e "###\n\n"
+fi
+
+# Normal
+##outfile2=$workPath/${prefN}_hg38.md.bam.br.table
+if [ ! -s time_BaseRecalibrator_${prefN}.log ] || [ ! -s ${prefN}_hg38.md.bam.br.table ]
+then
+    echo "### Executing BaseRecalibrator on ${prefN}.md.bam"
+    timeit -v -o time_BaseRecalibrator_${prefN}.log gatk \
+    --java-options "${br_opts}" BaseRecalibrator -R "${ref}" -I ${prefN}.md.bam \
+    --known-sites "${ref_dir}"/dbsnp_146.hg38.vcf.gz \
+    --known-sites "${ref_dir}"/Homo_sapiens_assembly38.known_indels.vcf.gz \
+    --known-sites "${ref_dir}"/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz \
+     -O ${prefN}_hg38.md.bam.br.table
+#    -- --spark-runner LOCAL --spark-master local[36] \
+#    --conf spark.local.dir=$workPath
+    echo -e "Time log written to time_BaseRecalibrator_${prefN}.log\n"
+    echo -e "###\n\n"
+fi
+
+
+# ApplyBQSR Tumor
+abqsr_opt="-Xmx200G -Xms100G -XX:+UseParallelGC -XX:ParallelGCThreads=4"
+abqsr_opt="${abqsr_opt} -Djava.library.path=$GATK_HOME/libs"
+abqsr_opt="-DGATK_STACKTRACE_ON_USER_EXCEPTION=true -Djava.io.tmpdir=/tmp"
+
+if [ ! -s time_ApplyBQSR_${prefT}.log ] || [ ! -s ${prefT}_hg38.md.br.bam ]
+then
+    echo "### Executing ApplyBQSR on ${prefT}_hg38.md.bam.br.table"
+    timeit -v -o time_ApplyBQSR_${prefT}.log  gatk \
+    --java-options "${abqsr_opt}" ApplyBQSR -R "${ref}" -I ${prefT}.md.bam \
+    -bqsr ${prefT}_hg38.md.bam.br.table --static-quantized-quals 10 \
+    --static-quantized-quals 20 --static-quantized-quals 30 \
+    -O pre_${prefT}_hg38.md.br.bam --use-jdk-inflater --use-jdk-deflater
+     echo -e "Time log written to time_AddOrReplaceReadGroups2_${prefT}.log\n"
+     timeit -v -o time_AddOrReplaceReadGroups2_${prefT}.log gatk  \
+     AddOrReplaceReadGroups -I pre_${prefT}_hg38.md.br.bam  \
+     -O ${prefT}_hg38.md.br.bam  --RGLB ${prefT} --RGPL illumina --RGPU ${prefT} \
+     --RGSM ${prefT} --SORT_ORDER 'coordinate' --CREATE_INDEX true
+#    timeit -v -o time_index2_${prefT}.log samtools index -@ 36 ${output1}
+    echo -e "###\n\n"
+fi
+
+# ApplyBQSR for Normal
+if [ ! -s time_ApplyBQSR_${prefN}.log ] || [ ! -s ${prefN}_hg38.md.br.bam ]
+then
+    echo "### Executing ApplyBQSR on ${prefN}_hg38.md.bam.br.table"
+    timeit -v -o time_ApplyBQSR_${prefN}.log  gatk \
+    --java-options "${abqsr_opt}" ApplyBQSR -R "${ref}" -I ${prefN}.md.bam \
+    -bqsr ${prefN}_hg38.md.bam.br.table --static-quantized-quals 10 \
+    --static-quantized-quals 20 --static-quantized-quals 30 \
+    -O pre_${prefN}_hg38.md.br.bam --use-jdk-inflater --use-jdk-deflater
+     echo -e "Time log written to time_AddOrReplaceReadGroups2_${prefN}.log\n"
+     timeit -v -o time_AddOrReplaceReadGroups2_${prefN}.log gatk  \
+     AddOrReplaceReadGroups -I pre_${prefN}_hg38.md.br.bam  \
+     -O ${prefN}_hg38.md.br.bam  --RGLB ${prefN} --RGPL illumina --RGPU ${prefN} \
+     --RGSM ${prefN} --SORT_ORDER 'coordinate' --CREATE_INDEX true
+     echo -e "###\n\n"
+fi
+
+# SOMATIC PIPELINE: MUTECT2 ##########
+# Based on blog https://software.broadinstitute.org/gatk/documentation/article?id=11136
+# 1. Call somatic short variants and generate a bamout
+Tumor_input=${prefT}_hg38.md.br.bam
+Normal_input=${prefN}_hg38.md.br.bam
+### get PON
+pon_opts="${opts} -XX:ConcGCThreads=1"
+if [ ! -s pon.vcf.gz ]
+then
+    echo "### Executing Mutect2 on ${Normal_input}"
+    timeit -v -o time_pon1Mutect2.log gatk --java-options "${pon_opts}" \
+    Mutect2 -R "${ref}" -I ${Normal_input} --max-mnp-distance 0 \
+    -O ${prefN}.vcf.gz --use-jdk-inflater --use-jdk-deflater
+
+    echo "#### CreateSomaticPanelOfNormals"
+    timeit -v -o time_CreateSomaticPanelOfNormals.log gatk  \
+    --java-options "${pon_opts}" CreateSomaticPanelOfNormals -R "${ref}" \
+    -V ${prefN}.vcf.gz -O pon.vcf.gz --use-jdk-inflater --use-jdk-deflater
+    echo -e "###\n\n"
+fi
+
+mutectstep1(){
+  Tumor_input=${prefT}_hg38.md.br.bam
+  Normal_input=${prefN}_hg38.md.br.bam
+  M2_output="${workPath}"/illumina_somatic_m2_${1}.vcf.gz
+  timeit -v -o time_Mutect2-step1_"${1}".log gatk \
+    --java-options "${opts}" Mutect2 -R "${ref}" -I ${Tumor_input} \
+    -I ${Normal_input} -tumor ${prefT} -normal ${prefN} \
+    --native-pair-hmm-threads 16 -pon pon.vcf.gz \
+    --af-of-alleles-not-in-resource 0.0000025 \
+    --disable-read-filter MateOnSameContigOrNoMappedMateReadFilter \
+    -L "${1}" -O "${M2_output}" --use-jdk-inflater --use-jdk-deflater
+}
+
+M2_output=illumina_somatic_m2.vcf.gz
+if [ ! -s "${M2_output}" ]
+then
+  echo "### Executing Mutect2 on ${Normal_input} AND ${Tumor_input}"
+timeit -v -o time_Mutect2-step1_"${1}".log gatk --java-options "${opts}" \
+  Mutect2 -R "${ref}" -I ${Tumor_input} -I ${Normal_input} -tumor ${prefT} \
+  -normal ${prefN} --native-pair-hmm-threads 16 -pon pon.vcf.gz \
+  --af-of-alleles-not-in-resource 0.0000025 \
+  --disable-read-filter MateOnSameContigOrNoMappedMateReadFilter \
+  -O "${M2_output}" --use-jdk-inflater --use-jdk-deflater
+  echo -e "###\n\n"
+fi
+## export -f mutectstep1
+## export workPath
+## export opts
+## export prefT
+## export prefN
+## export ref
+## parallel --eta --bar -j 10 --joblog /tmp/log --env=mutectstep1 \
+## --env=opts --env=ref --env=prefT --env=prefN --env=workPath \
+## mutectstep1 ::: "$(cut -f1 "${ref}".fai| uniq)"
+##
+## Merge VCF files
+## ls -tr "${PWD}"/illumina_somatic_m2_*.vcf.gz > illumina_somatic_m2.list
+## timeit -v -o time_gatkMergeVCF-m2.log gatk --java-options "${opts}" \
+## MergeVcfs -I illumina_somatic_m2.list -O illumina_somatic_m2.vcf \
+## -use-jdk-inflater true -use-jdk-deflater true
+
+# 3. Estimate cross-sample contamination using GetPileupSummaries and CalculateContamination
+if [ ! -s "${prefT}"_getpileupsummaries.table ]
+then
+  echo "### Executing GetPileupSummaries on ${Tumor_input}"
+  timeit -v -o time_gatkGetPileupSummaries.log gatk --java-options \
+  "${opts}" GetPileupSummaries -I "${Tumor_input}" \
+  -V "${ref_dir}"/small_exac_common_3.hg38.vcf.gz \
+  -L "${ref_dir}"/wgs_calling_regions.hg38.interval_list \
+  -O "${prefT}"_getpileupsummaries.table
+  echo -e "###\n\n"
+fi
+
+if [ ! -s "${prefT}"_calculatecontamination.table ]
+then
+  echo "### Executing CalculateContamination ${prefT}_getpileupsummaries.table"
+  timeit -v -o time_gatkCalculateContamination.log gatk --java-options \
+  "${opts}" CalculateContamination -I "${prefT}"_getpileupsummaries.table \
+  -O "${prefT}"_calculatecontamination.table
+  echo -e "###\n\n"
+fi
+
+# 4. Filter for confident somatic calls using FilterMutectCalls
+if [ ! -s llumina_somatic_oncefiltered.vcf.gz ]
+then
+  echo "### Executing FilterMutectCalls"
+  timeit -v -o time_gatkFilterMutectCalls.log gatk --java-options \
+  "${opts}" FilterMutectCalls -V "${M2_output}"  -R "${ref}"\
+  --contamination-table "${prefT}"_calculatecontamination.table \
+  -O illumina_somatic_oncefiltered.vcf.gz
+  echo -e "###\n\n"
+fi
+##### OPTINAL STEPS #####
+# 5. (Optional) Estimate artifacts with CollectSequencingArtifactMetrics and filter them with FilterByOrientationBias
+if [ ! -s illumina_tumor_artifact ]
+then
+  echo "### Executing CollectSequencingArtifactMetrics"
+  timeit -v -o time_gatkCollectSequencingArtifactMetrics.log gatk \
+  --java-options "${opts}" CollectSequencingArtifactMetrics -R "${ref}" \
+  -I "${Tumor_input}" -O illumina_tumor_artifact
+  echo -e "###\n\n"
+fi
+
+if [ ! -s illumina_somatic_twicefiltered.vcf.gz ]
+then
+  timeit -v -o time_gatkFilterByOrientationBias.log gatk \
+  --java-options "${opts}" FilterByOrientationBias -AM 'G/T' -AM 'C/T' \
+  -V illumina_somatic_oncefiltered.vcf.gz \
+  -P illumina_tumor_artifact.pre_adapter_detail_metrics \
+  -O illumina_somatic_twicefiltered.vcf.gz
+fi
+
+
+
